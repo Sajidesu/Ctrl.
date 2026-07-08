@@ -1,269 +1,155 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from pydantic import BaseModel
-from typing import List, Optional
-import time
+import base64
+import uuid
 import json
-import os
-from dotenv import load_dotenv
 import chromadb
-from PyPDF2 import PdfReader
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import JSONResponse
 from openai import OpenAI
 
-# ==========================================
-# 1. INITIALIZATION & INFRASTRUCTURE
-# ==========================================
+app = FastAPI(title="Gemma 4 RAG Quiz Engine")
 
-# Load hidden environment variables securely
-load_dotenv()
-FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY")
-
-if not FIREWORKS_API_KEY:
-    raise ValueError("CRITICAL ERROR: FIREWORKS_API_KEY is missing from the .env file!")
-
-# Initialize Fireworks Client via OpenAI SDK
+# Initialize OpenAI client pointed to Fireworks AI
+# Replace with your actual Fireworks API key
+FIREWORKS_API_KEY = "YOUR_FIREWORKS_API_KEY"
 client = OpenAI(
-    base_url="https://api.fireworks.ai/inference/v1",
+    base_url="https://api.fireworks.ai/inference/v1", 
     api_key=FIREWORKS_API_KEY
 )
 
-# Initialize embedded local vector database for fast OS-level interception
-chroma_client = chromadb.PersistentClient(path="./ctrl_chroma_db")
-collection = chroma_client.get_or_create_collection(name="study_materials")
+# Use your exact chosen Gemma 4 deployment path
+GEMMA_DEPLOYMENT = "accounts/your_username/deployments/your_deployment_name"
 
-app = FastAPI(title="Ctrl Backend - Final Hackathon Build")
+# Initialize ChromaDB persistent storage locally on the server
+chroma_client = chromadb.PersistentClient(path="./chroma_db")
+collection = chroma_client.get_or_create_collection(name="textbook_materials")
 
-# Global In-Memory State Tracker
-class ActiveSessionData:
-    def __init__(self):
-        self.is_active: bool = False
-        self.start_time: float = 0.0
-        self.study_minutes: int = 0
-        self.break_minutes: int = 0
-        self.ai_adjusted_break: bool = False
-        self.blocked_apps: List[str] = []
-        self.current_material: str = ""
+def encode_image(file_bytes: bytes) -> str:
+    """Converts raw image bytes to a base64 string for the vision model."""
+    return base64.b64encode(file_bytes).decode('utf-8')
 
-current_session = ActiveSessionData()
+@app.post("/upload-material/")
+async def upload_material(title: str = Form(...), file: UploadFile = File(...)):
+    """
+    Phase 1: Receives a textbook image, extracts text using Gemma Vision,
+    chunks it, and saves the text alongside metadata into ChromaDB.
+    """
+    try:
+        # 1. Read and encode the incoming image file
+        image_bytes = await file.read()
+        base64_image = encode_image(image_bytes)
+        
+        # 2. Extract text using Gemma 4 Vision capability
+        vision_completion = client.chat.completions.create(
+            model=GEMMA_DEPLOYMENT,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Extract all academic text from this textbook page perfectly. Output only the plain text."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                    ]
+                }
+            ]
+        )
+        extracted_text = vision_completion.choices[0].message.content
+        
+        if not extracted_text:
+            raise HTTPException(status_code=500, detail="Failed to extract text from image.")
 
+        # 3. Text Chunking (Simple paragraph splitter for hackathon velocity)
+        chunks = [chunk.strip() for chunk in extracted_text.split("\n\n") if chunk.strip()]
+        
+        if not chunks:
+            return {"status": "success", "title": title, "chunks_saved": 0, "message": "No text detected."}
 
-# ==========================================
-# 2. DATA MODELS (Pydantic)
-# ==========================================
+        # 4. Prepare batch arrays for ChromaDB
+        chunk_ids = [str(uuid.uuid4()) for _ in chunks]
+        metadatas = [{"title": title} for _ in chunks]
+        
+        # 5. Insert translated text chunks into the vector database
+        collection.add(
+            documents=chunks,
+            metadatas=metadatas,
+            ids=chunk_ids
+        )
+        
+        return {
+            "status": "success", 
+            "title": title, 
+            "chunks_saved": len(chunks)
+        }
 
-class CreateSessionRequest(BaseModel):
-    study_minutes: int
-    break_minutes: Optional[int] = 0 
-    ai_adjusted_break: bool = False   
-    pages_to_study: int = 1  
-    blocked_apps: List[str]
-    current_material: str
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-class SessionActionRequest(BaseModel):
-    action: str 
-
-class QuizRequest(BaseModel):
-    filename: str
-    start_page: int
-    end_page: int
-
-class QuizVerificationRequest(BaseModel):
-    total_questions: int
-    correct_answers: int
-
-
-# ==========================================
-# 3. PHASE 1: ASYNCHRONOUS INGESTION
-# ==========================================
-
-@app.post("/upload-syllabus/")
-async def upload_syllabus(file: UploadFile = File(...)):
-    """Parses a PDF, chunks it by page, gets embeddings, and stores in ChromaDB."""
-    reader = PdfReader(file.file)
-    documents, metadatas, ids = [], [], []
-    
-    for page_num, page in enumerate(reader.pages):
-        text = page.extract_text()
-        if text and text.strip():
-            documents.append(text)
-            metadatas.append({"page": page_num + 1, "filename": file.filename})
-            ids.append(f"{file.filename}_page_{page_num + 1}")
-
-    if not documents:
-        raise HTTPException(status_code=400, detail="Could not extract text from the PDF.")
-
-    # Call Fireworks for Nomic Embeddings
-    embedding_response = client.embeddings.create(
-        model="nomic-ai/nomic-embed-text-v1.5",
-        input=documents
-    )
-    embeddings = [data.embedding for data in embedding_response.data]
-
-    # Store locally
-    collection.add(documents=documents, embeddings=embeddings, metadatas=metadatas, ids=ids)
-    
-    return {"status": "success", "message": f"Ingested {len(documents)} pages into ChromaDB."}
-
-
-# ==========================================
-# 4. PHASE 2: REAL-TIME GENERATION & GRADING
-# ==========================================
 
 @app.post("/generate-quiz/")
-async def generate_quiz(request: QuizRequest):
-    """Fetches text from ChromaDB and generates a JSON quiz via Fireworks LLM."""
-    results = collection.get(
-        where={
-            "$and": [
-                {"filename": request.filename},
-                {"page": {"$gte": request.start_page}},
-                {"page": {"$lte": request.end_page}}
-            ]
-        }
-    )
-    
-    if not results['documents']:
-        raise HTTPException(status_code=404, detail="No text found for those pages.")
-        
-    context_text = "\n".join(results['documents'])
-    
-    system_prompt = (
-        "You are an educational AI. Based ONLY on the provided context, generate a 5-question multiple choice quiz. "
-        "You MUST output your response in valid JSON format with the following structure: "
-        "{'quiz': [{'question': '...', 'options': ['A', 'B', 'C', 'D'], 'answer': 'Exact string of correct option'}]} "
-        "Do not include any conversational text."
-    )
-    
-    chat_completion = client.chat.completions.create(
-        model="accounts/fireworks/models/gemma-4-31b-it",
-        response_format={"type": "json_object"}, 
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Context: {context_text}"}
-        ]
-    )
-    
+async def generate_quiz(topic: str = Form(...), title: str = Form(...)):
+    """
+    Phase 2: Queries ChromaDB by metadata title and semantic topic,
+    then feeds grounded text context to Gemma 4 to output a structured quiz.
+    """
     try:
-        return json.loads(chat_completion.choices[0].message.content)
+        # 1. Query ChromaDB using metadata filters and semantic similarity query
+        results = collection.query(
+            query_texts=[topic],
+            n_results=4,
+            where={"title": title}  # Ensures search stays strictly inside this specific material
+        )
+        
+        # Flatten retrieved text documents into a single context string
+        retrieved_documents = results.get("documents", [[]])[0]
+        context_text = "\n---\n".join(retrieved_documents)
+        
+        if not context_text:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "INSUFFICIENT_DATA", "message": "No relevant material found for this topic."}
+            )
+
+        # 2. Establish strict grounding rules using the instruction-tuned system prompt
+        system_prompt = (
+            "You are an academic instructor. Your ONLY task is to generate multiple-choice questions based EXCLUSIVELY on the provided Context.\n"
+            "Rules:\n"
+            "1. Use ONLY the information provided in the Context to form your questions and answers.\n"
+            "2. If the Context does not contain enough information to reliably answer a question, return the string 'INSUFFICIENT_DATA' instead of fabricating data.\n"
+            "3. Do not use outside knowledge or training data.\n"
+            "4. Return the output as a raw JSON array matching this structure exactly: "
+            "[{\"question\": \"...\", \"options\": [\"A\", \"B\", \"C\", \"D\"], \"correct_answer\": \"...\"}]"
+        )
+        
+        user_content = f"Context:\n{context_text}\n\nTask: Generate a 3-question multiple-choice quiz based on the topic: '{topic}'."
+
+        # 3. Execute reasoning step with Gemma 4
+        quiz_completion = client.chat.completions.create(
+            model=GEMMA_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ],
+            temperature=0.2  # Low temperature forces strict adherence to rules and schemas
+        )
+        
+        raw_output = quiz_completion.choices[0].message.content.strip()
+        
+        # Guardrail: Check if the model triggered the out-of-bounds safety keyword
+        if "INSUFFICIENT_DATA" in raw_output:
+            return JSONResponse(
+                status_code=400, 
+                content={"error": "INSUFFICIENT_DATA", "message": "The material does not contain enough data on this topic."}
+            )
+
+        # 4. Clean formatting wrappers if the model accidentally includes markdown json blocks
+        if raw_output.startswith("```json"):
+            raw_output = raw_output.replace("```json", "", 1).rstrip("```").strip()
+        elif raw_output.startswith("```"):
+            raw_output = raw_output.replace("```", "", 1).rstrip("```").strip()
+
+        # Parse string safely into native JSON array for the mobile client
+        quiz_json = json.loads(raw_output)
+        return quiz_json
+
     except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="LLM failed to return valid JSON.")
-
-
-@app.post("/session/verify-quiz")
-async def verify_quiz_score(request: QuizVerificationRequest):
-    """Verifies if the user scored >= 50% to unlock their intercepted apps."""
-    if request.total_questions <= 0:
-        raise HTTPException(status_code=400, detail="Total questions must be greater than 0.")
-        
-    score_percentage = (request.correct_answers / request.total_questions) * 100
-    
-    if score_percentage >= 50.0:
-        current_session.is_active = False  # Shut down the OS lock
-        return {
-            "passed": True,
-            "score_percentage": score_percentage,
-            "message": f"Passed with {score_percentage:.1f}%. App block deactivated."
-        }
-    
-    return {
-        "passed": False,
-        "score_percentage": score_percentage,
-        "message": f"Failed with {score_percentage:.1f}%. You need at least 50% to unlock. Try again!"
-    }
-
-
-# ==========================================
-# 5. PHASE 3: SESSION STATE MANAGEMENT
-# ==========================================
-
-@app.get("/session/status")
-async def get_session_status():
-    """Kotlin calls this on dashboard load to determine the UI state."""
-    if not current_session.is_active:
-        return {"has_ongoing_session": False}
-    
-    elapsed_seconds = time.time() - current_session.start_time
-    elapsed_minutes = int(elapsed_seconds // 60)
-    
-    return {
-        "has_ongoing_session": True,
-        "elapsed_minutes": elapsed_minutes,
-        "study_minutes": current_session.study_minutes,
-        "break_minutes": current_session.break_minutes,
-        "ai_adjusted_break": current_session.ai_adjusted_break,
-        "blocked_apps": current_session.blocked_apps,
-        "current_material": current_session.current_material
-    }
-
-
-@app.post("/session/start")
-async def start_session(request: CreateSessionRequest):
-    """Instantiates a session and calculates cognitive load if AI break is enabled."""
-    if current_session.is_active:
-        raise HTTPException(status_code=400, detail="A session is already running.")
-    
-    current_session.is_active = True
-    current_session.start_time = time.time()
-    current_session.study_minutes = request.study_minutes
-    current_session.blocked_apps = request.blocked_apps
-    current_session.current_material = request.current_material
-    current_session.ai_adjusted_break = request.ai_adjusted_break
-    
-    study_density_flag = "standard"
-    
-    if request.ai_adjusted_break:
-        # Calculate Study Density (pages per minute)
-        study_density = request.pages_to_study / max(request.study_minutes, 1)
-        
-        # Determine Intensity Multiplier based on Cognitive Load
-        if study_density >= 1.0:
-            intensity_multiplier = 1.5   # Extreme Cramming
-            study_density_flag = "cramming"
-        elif study_density > 0.5:
-            intensity_multiplier = 1.2   # Heavy Load
-            study_density_flag = "heavy"
-        elif study_density < 0.2:
-            intensity_multiplier = 0.8   # Light Reading
-            study_density_flag = "light"
-        else:
-            intensity_multiplier = 1.0   # Standard Pace
-            
-        # Apply to Base Ratio (20% of study time is standard break)
-        base_break_minutes = request.study_minutes * 0.20
-        calculated_break = int(base_break_minutes * intensity_multiplier)
-        
-        # Enforce Guardrails (Min 3 mins, Max 50% of total study time)
-        max_allowed_break = int(request.study_minutes * 0.5)
-        current_session.break_minutes = max(3, min(calculated_break, max_allowed_break))
-        
-    else:
-        current_session.break_minutes = request.break_minutes
-    
-    return {
-        "status": "success", 
-        "message": "Ctrl intercept activated.",
-        "allocated_break_minutes": current_session.break_minutes,
-        "study_density_flag": study_density_flag
-    }
-
-
-@app.post("/session/verify-action")
-async def verify_session_action(request: SessionActionRequest):
-    """Checks the strict 5-minute grace period before allowing modification."""
-    if not current_session.is_active:
-        raise HTTPException(status_code=400, detail="No active session found.")
-    
-    elapsed_seconds = time.time() - current_session.start_time
-    elapsed_minutes = elapsed_seconds / 60.0
-    
-    if elapsed_minutes < 5.0:
-        if request.action == "cancel":
-            current_session.is_active = False
-        return {
-            "quiz_required": False,
-            "message": f"Action allowed without quiz. Elapsed time: {int(elapsed_seconds)}s"
-        }
-    
-    return {
-        "quiz_required": True,
-        "message": "Grace period expired. A RAG quiz must be passed to authorize this modification."
-    }
+        raise HTTPException(status_code=500, detail="Model failed to output a valid JSON format. Try again.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
