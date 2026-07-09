@@ -6,13 +6,14 @@ import chromadb
 import fitz  # PyMuPDF for handling PDFs
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from openai import OpenAI
 from dotenv import load_dotenv
 
 # Load environment variables from the .env file
 load_dotenv()
 
-app = FastAPI(title="Ctrl. Backend - Gemma 4 RAG Engine")
+app = FastAPI(title="Ctrl. Backend - Gamified RAG Engine")
 
 # Pull the API key securely from the environment
 FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY")
@@ -46,12 +47,10 @@ def encode_image(file_bytes: bytes) -> str:
     """Converts raw image bytes to a base64 string for the vision model."""
     return base64.b64encode(file_bytes).decode('utf-8')
 
-# --- 🧠 COGNITIVE LOAD MATH HELPER ---
+# --- 🧠 MATH & LOGIC HELPERS ---
 def calculate_optimal_break(study_time_minutes: int) -> int:
     """
     Calculates the optimal break duration based on the cognitive load formula.
-    - <= 60m: Flat 20% ratio.
-    - > 60m: 12 minutes plus 10% of the time beyond the first hour.
     """
     if study_time_minutes <= 60:
         break_time = study_time_minutes * 0.2
@@ -60,6 +59,11 @@ def calculate_optimal_break(study_time_minutes: int) -> int:
         
     return int(round(break_time))
 
+# Pydantic model for receiving quiz results
+class QuizResult(BaseModel):
+    total_questions: int
+    correct_answers: int
+
 # ==========================================
 # 🚀 API ENDPOINTS
 # ==========================================
@@ -67,7 +71,7 @@ def calculate_optimal_break(study_time_minutes: int) -> int:
 @app.get("/calculate-break/")
 async def get_break_time(study_time: int = Query(..., description="Study session length in minutes")):
     """
-    Frontend can call this when the user selects 'AI Decide' for their break.
+    Returns the optimal break time based on how long the user studied.
     """
     if study_time <= 0:
         raise HTTPException(status_code=400, detail="Study time must be greater than 0.")
@@ -229,3 +233,31 @@ async def generate_quiz(topic: str = Form(...), selected_titles: str = Form(...)
         raise HTTPException(status_code=500, detail="Model failed to output a valid JSON format. Try again.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/evaluate-quiz/")
+async def evaluate_quiz(result: QuizResult):
+    """
+    Phase 4: Evaluates the quiz score and dictates the next app state.
+    Pass >= 50%: Lifts the app lock, allowing break or session update.
+    Fail < 50%: Lock remains in place.
+    """
+    if result.total_questions <= 0:
+        raise HTTPException(status_code=400, detail="Total questions must be greater than 0.")
+        
+    score_percentage = (result.correct_answers / result.total_questions) * 100
+    passed = score_percentage >= 50.0
+    
+    if passed:
+        return {
+            "passed": True,
+            "score": score_percentage,
+            "action": "DISMISS_OVERLAY",
+            "message": "You passed! You may now take your break or update your study session."
+        }
+    else:
+        return {
+            "passed": False,
+            "score": score_percentage,
+            "action": "MAINTAIN_LOCK",
+            "message": "Score too low. Return to your textbook and try again to unlock."
+        }
