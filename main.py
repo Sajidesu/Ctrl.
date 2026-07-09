@@ -1,16 +1,25 @@
+import os
 import base64
 import uuid
 import json
 import chromadb
 import fitz  # PyMuPDF for handling PDFs
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.responses import JSONResponse
 from openai import OpenAI
+from dotenv import load_dotenv
 
-app = FastAPI(title="Gemma 4 Omni-Channel RAG Engine")
+# Load environment variables from the .env file
+load_dotenv()
 
-# Initialize OpenAI client pointed to Fireworks AI
-FIREWORKS_API_KEY = "YOUR_FIREWORKS_API_KEY"
+app = FastAPI(title="Ctrl. Backend - Gemma 4 RAG Engine")
+
+# Pull the API key securely from the environment
+FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY")
+
+if not FIREWORKS_API_KEY:
+    raise ValueError("FIREWORKS_API_KEY is not set. Please check your .env file.")
+
 client = OpenAI(
     base_url="https://api.fireworks.ai/inference/v1", 
     api_key=FIREWORKS_API_KEY
@@ -37,13 +46,44 @@ def encode_image(file_bytes: bytes) -> str:
     """Converts raw image bytes to a base64 string for the vision model."""
     return base64.b64encode(file_bytes).decode('utf-8')
 
+# --- 🧠 COGNITIVE LOAD MATH HELPER ---
+def calculate_optimal_break(study_time_minutes: int) -> int:
+    """
+    Calculates the optimal break duration based on the cognitive load formula.
+    - <= 60m: Flat 20% ratio.
+    - > 60m: 12 minutes plus 10% of the time beyond the first hour.
+    """
+    if study_time_minutes <= 60:
+        break_time = study_time_minutes * 0.2
+    else:
+        break_time = 12 + ((study_time_minutes - 60) * 0.1)
+        
+    return int(round(break_time))
+
+# ==========================================
+# 🚀 API ENDPOINTS
+# ==========================================
+
+@app.get("/calculate-break/")
+async def get_break_time(study_time: int = Query(..., description="Study session length in minutes")):
+    """
+    Frontend can call this when the user selects 'AI Decide' for their break.
+    """
+    if study_time <= 0:
+        raise HTTPException(status_code=400, detail="Study time must be greater than 0.")
+        
+    recommended_break = calculate_optimal_break(study_time)
+    
+    return {
+        "study_time_minutes": study_time,
+        "recommended_break_minutes": recommended_break
+    }
+
+
 @app.post("/upload-material/")
 async def upload_material(title: str = Form(...), file: UploadFile = File(...)):
     """
-    Phase 1: Receives an image or PDF.
-    - If Image: Extracts text using the Vision LLM.
-    - If PDF: Natively parses the digital text.
-    Chunks the text and saves it alongside metadata into ChromaDB.
+    Phase 1: Receives an image or PDF. Extracts text and saves it into ChromaDB.
     """
     try:
         file_bytes = await file.read()
@@ -101,6 +141,9 @@ async def upload_material(title: str = Form(...), file: UploadFile = File(...)):
 
 @app.get("/materials/")
 async def list_materials():
+    """
+    Phase 2: Returns unique titles for the frontend session setup wizard.
+    """
     try:
         db_data = collection.get(include=["metadatas"])
         metadatas = db_data.get("metadatas", [])
@@ -112,9 +155,7 @@ async def list_materials():
 @app.post("/generate-quiz/")
 async def generate_quiz(topic: str = Form(...), selected_titles: str = Form(...), length: int = Form(5)):
     """
-    Phase 3: Queries ChromaDB by metadata titles and semantic topic,
-    then feeds grounded text context to the LLM to output a structured quiz.
-    Takes a 'length' parameter (5 to 25) determined by the Android frontend.
+    Phase 3: Queries ChromaDB and generates the JSON quiz array.
     """
     try:
         title_list = [t.strip() for t in selected_titles.split(",") if t.strip()]
@@ -122,13 +163,11 @@ async def generate_quiz(topic: str = Form(...), selected_titles: str = Form(...)
         if not title_list:
             raise HTTPException(status_code=400, detail="You must select at least one material.")
             
-        # Ensure requested length is within valid bounds (5-25)
         quiz_length = max(5, min(25, length))
 
-        # Query ChromaDB 
         results = collection.query(
             query_texts=[topic],
-            n_results=quiz_length * 2, # Pull enough context chunks to support the requested length
+            n_results=quiz_length * 2, 
             where={"title": {"$in": title_list}} 
         )
         
