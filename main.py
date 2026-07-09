@@ -50,9 +50,7 @@ async def upload_material(title: str = Form(...), file: UploadFile = File(...)):
         content_type = file.content_type
         extracted_text = ""
         
-        # --- 1. ROUTE BASED ON FILE TYPE ---
         if "image" in content_type:
-            # Handle Physical Textbook Photos via Vision LLM
             base64_image = encode_image(file_bytes)
             active_vision_model = SERVERLESS_VISION if DEBUG_MODE else GEMMA_DEPLOYMENT
             
@@ -71,33 +69,23 @@ async def upload_material(title: str = Form(...), file: UploadFile = File(...)):
             extracted_text = vision_completion.choices[0].message.content
             
         elif "pdf" in content_type:
-            # Handle Digital PDFs via PyMuPDF (Lightning Fast)
             pdf_document = fitz.open(stream=file_bytes, filetype="pdf")
             pdf_text_pages = []
-            
             for page_num in range(len(pdf_document)):
                 page = pdf_document.load_page(page_num)
-                # Extract text and append to our page array
                 pdf_text_pages.append(page.get_text("text"))
-                
             extracted_text = "\n\n".join(pdf_text_pages)
             pdf_document.close()
-            
         else:
-            raise HTTPException(status_code=400, detail="Unsupported file type. Please upload an image or a PDF.")
+            raise HTTPException(status_code=400, detail="Unsupported file type.")
 
-        # --- 2. VALIDATE EXTRACTION ---
         if not extracted_text or not extracted_text.strip():
             raise HTTPException(status_code=500, detail="Failed to extract text from the file.")
 
-        # --- 3. TEXT CHUNKING ---
-        # Split by double line breaks to isolate paragraphs/sections
         chunks = [chunk.strip() for chunk in extracted_text.split("\n\n") if len(chunk.strip()) > 20]
-        
         if not chunks:
-            return {"status": "success", "title": title, "chunks_saved": 0, "message": "No meaningful text detected."}
+            return {"status": "success", "title": title, "chunks_saved": 0}
 
-        # --- 4. PREPARE & SAVE TO CHROMADB ---
         chunk_ids = [str(uuid.uuid4()) for _ in chunks]
         metadatas = [{"title": title} for _ in chunks]
         
@@ -107,74 +95,57 @@ async def upload_material(title: str = Form(...), file: UploadFile = File(...)):
             ids=chunk_ids
         )
         
-        return {
-            "status": "success", 
-            "title": title, 
-            "chunks_saved": len(chunks),
-            "file_type_processed": "PDF" if "pdf" in content_type else "Image",
-            "mode": "DEBUG_SERVERLESS" if DEBUG_MODE else "PRODUCTION_GEMMA"
-        }
-
+        return {"status": "success", "title": title, "chunks_saved": len(chunks)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.get("/materials/")
 async def list_materials():
-    """
-    Phase 2: The Intercept.
-    Returns a list of all unique material titles saved in the database
-    so the Kotlin frontend can render the selection checkboxes.
-    """
     try:
-        # Get all metadata from ChromaDB
         db_data = collection.get(include=["metadatas"])
         metadatas = db_data.get("metadatas", [])
-        
-        # Extract unique titles using a set
         unique_titles = list(set([meta["title"] for meta in metadatas if meta and "title" in meta]))
-        
         return {"saved_materials": unique_titles}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/generate-quiz/")
-async def generate_quiz(topic: str = Form(...), selected_titles: str = Form(...)):
+async def generate_quiz(topic: str = Form(...), selected_titles: str = Form(...), length: int = Form(5)):
     """
     Phase 3: Queries ChromaDB by metadata titles and semantic topic,
     then feeds grounded text context to the LLM to output a structured quiz.
-    Note: selected_titles should be passed as a comma-separated string from Android.
+    Takes a 'length' parameter (5 to 25) determined by the Android frontend.
     """
     try:
         title_list = [t.strip() for t in selected_titles.split(",") if t.strip()]
         
         if not title_list:
-            raise HTTPException(status_code=400, detail="You must select at least one material to generate a quiz.")
+            raise HTTPException(status_code=400, detail="You must select at least one material.")
+            
+        # Ensure requested length is within valid bounds (5-25)
+        quiz_length = max(5, min(25, length))
 
-        # 1. Query ChromaDB using metadata filters ($in allows multiple titles) and semantic similarity
+        # Query ChromaDB 
         results = collection.query(
             query_texts=[topic],
-            n_results=5, # Pull top 5 most relevant paragraphs
+            n_results=quiz_length * 2, # Pull enough context chunks to support the requested length
             where={"title": {"$in": title_list}} 
         )
         
-        # Flatten retrieved text documents into a single context string
         retrieved_documents = results.get("documents", [[]])[0]
         context_text = "\n---\n".join(retrieved_documents)
         
         if not context_text:
             return JSONResponse(
                 status_code=400,
-                content={"error": "INSUFFICIENT_DATA", "message": "No relevant material found for this topic in the selected chapters."}
+                content={"error": "INSUFFICIENT_DATA", "message": "No relevant material found for this topic."}
             )
 
-        # 2. Establish strict grounding rules using the instruction-tuned system prompt
         system_prompt = (
             "You are an academic instructor. Your ONLY task is to generate multiple-choice questions based EXCLUSIVELY on the provided Context.\n"
             "Rules:\n"
             "1. Use ONLY the information provided in the Context to form your questions and answers.\n"
-            "2. If the Context does not contain enough information to reliably answer a question, return the string 'INSUFFICIENT_DATA' instead of fabricating data.\n"
+            "2. If the Context does not contain enough information, return 'INSUFFICIENT_DATA' instead of fabricating data.\n"
             "3. Do not use outside knowledge or training data.\n"
             "4. Return the output as a raw JSON array matching this structure exactly:\n"
             "[\n"
@@ -186,9 +157,8 @@ async def generate_quiz(topic: str = Form(...), selected_titles: str = Form(...)
             "]"
         )
         
-        user_content = f"Context:\n{context_text}\n\nTask: Generate a 3-question multiple-choice quiz based on the topic: '{topic}'."
+        user_content = f"Context:\n{context_text}\n\nTask: Generate a {quiz_length}-question multiple-choice quiz based on the topic/pages: '{topic}'."
 
-        # 3. Execute reasoning step with Text LLM
         active_text_model = SERVERLESS_TEXT if DEBUG_MODE else GEMMA_DEPLOYMENT
 
         quiz_completion = client.chat.completions.create(
@@ -197,25 +167,22 @@ async def generate_quiz(topic: str = Form(...), selected_titles: str = Form(...)
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content}
             ],
-            temperature=0.2  # Low temperature forces strict adherence to rules and schemas
+            temperature=0.2 
         )
         
         raw_output = quiz_completion.choices[0].message.content.strip()
         
-        # Guardrail: Check if the model triggered the out-of-bounds safety keyword
         if "INSUFFICIENT_DATA" in raw_output:
             return JSONResponse(
                 status_code=400, 
                 content={"error": "INSUFFICIENT_DATA", "message": "The material does not contain enough data on this topic."}
             )
 
-        # 4. Clean formatting wrappers if the model accidentally includes markdown json blocks
         if raw_output.startswith("```json"):
             raw_output = raw_output.replace("```json", "", 1).rstrip("```").strip()
         elif raw_output.startswith("```"):
             raw_output = raw_output.replace("```", "", 1).rstrip("```").strip()
 
-        # Parse string safely into native JSON array for the mobile client
         quiz_json = json.loads(raw_output)
         return quiz_json
 
