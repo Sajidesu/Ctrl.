@@ -261,3 +261,26 @@ async def evaluate_quiz(result: QuizResult):
             "action": "MAINTAIN_LOCK",
             "message": "Score too low. Return to your textbook and try again to unlock."
         }
+    
+@app.on_event("startup")
+async def load_demo_data():
+    """Automatically loads sample data so judges have something to test immediately."""
+    demo_title = "Demo: Introduction to AMD Architectures"
+    
+    # Check if demo data already exists so we don't duplicate it
+    existing_data = collection.get(include=["metadatas"])
+    titles = [meta["title"] for meta in existing_data.get("metadatas", []) if meta]
+    
+    if demo_title not in titles:
+        demo_text = (
+            "Advanced Micro Devices (AMD) is a leader in high-performance computing. "
+            "Their recent architectures focus heavily on parallel processing and efficient "
+            "workload distribution, which is critical for running modern LLMs efficiently."
+        )
+        
+        collection.add(
+            documents=[demo_text],
+            metadatas=[{"title": demo_title}],
+            ids=["demo_chunk_1"]
+        )
+        print("Demo data loaded for judges!")
